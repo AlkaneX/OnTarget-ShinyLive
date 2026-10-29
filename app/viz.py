@@ -24,6 +24,9 @@ DEFICIENT_COLOR = "#0072B2"   # blue
 EXCESSIVE_COLOR = "#9E0142"   # red (dark crimson)
 OK_COLOR = "#9ACD32"          # green (light yellow-green)
 DOT_OUTLINE = dict(color="rgba(0,0,0,0.55)", width=1)   # keeps light dots visible on white
+# Behind the NAME of an element that is already on target, as a highlighter pen
+# would. Pale enough to leave the black label fully readable.
+ON_TARGET_FILL = "#cfeab4"
 
 
 def fade_color(r: float) -> str:
@@ -85,6 +88,10 @@ def nutrient_anti_spider(adequacy_rows: list[dict]) -> go.Figure:
         else:
             colors.append(OK_COLOR)
 
+    # Nutrients inside their range. app.py passes these to the page so the
+    # chart's own labels can be highlighted (see ON_TARGET_FILL).
+    on_target = [row["nutrient"] for row in adequacy_rows if row["direction"] == "ok"]
+
     hover = []
     for row in adequacy_rows:
         sev = row.get("severity", 0.0)
@@ -119,6 +126,7 @@ def nutrient_anti_spider(adequacy_rows: list[dict]) -> go.Figure:
             ),
             angularaxis=dict(tickfont=dict(size=10)),
         ),
+        meta=dict(ontarget=on_target),
         showlegend=False,
         # No chart title: the color legend is shown as text above the chart.
         # Same margins + height as the HEI and HDB charts, so all three round
@@ -141,6 +149,7 @@ def hei_anti_spider(component_scores: dict[str, float], bounds: dict[str, dict])
     thetas = []
     rs = []
     hover = []
+    on_target = []
     for name in order:
         max_sc = bounds[name]["max_score"]
         sc = float(component_scores.get(name, 0.0))
@@ -148,6 +157,8 @@ def hei_anti_spider(component_scores: dict[str, float], bounds: dict[str, dict])
         label = f"{name} ({int(max_sc)}pt)"
         thetas.append(label)
         rs.append(r)
+        if r <= 1e-9:                      # full score: this component is on target
+            on_target.append(label)
         hover.append(f"<b>{name}</b><br>Score: {sc:.2f} / {int(max_sc)}<br>"
                      f"Direction: {bounds[name]['direction']}<br>"
                      f"% of max: {100*(1-r):.0f}%")
@@ -181,6 +192,7 @@ def hei_anti_spider(component_scores: dict[str, float], bounds: dict[str, dict])
             ),
             angularaxis=dict(tickfont=dict(size=10)),
         ),
+        meta=dict(ontarget=on_target),
         showlegend=False,
         margin=ROUND_CHART_MARGIN, height=ROUND_CHART_HEIGHT,
         # Keeps the total score; the dot-color explanation is shown above the chart.
@@ -199,13 +211,15 @@ def hdb_bullseye(assessment: dict) -> go.Figure:
     Proportional in between: half the target share puts the dot halfway. The title
     shows the mean adequacy of the 6 groups as a score out of 100.
     """
-    thetas, rs, hover = [], [], []
+    thetas, rs, hover, on_target = [], [], [], []
     for row in assessment["rows"]:
         target = row["target_kcal"]
         pct = row["pct_of_target"]
         r = 1.0 - row["adequacy"]
         thetas.append(row["group"])
         rs.append(r)
+        if r <= 1e-9:                      # share meets or beats the target
+            on_target.append(row["group"])
         div = "met" if row["meets_diversity"] else "below minimum"
         hover.append(
             f"<b>{row['group']}</b><br>"
@@ -235,6 +249,7 @@ def hdb_bullseye(assessment: dict) -> go.Figure:
             ),
             angularaxis=dict(tickfont=dict(size=12)),
         ),
+        meta=dict(ontarget=on_target),
         showlegend=False,
         # Wide side margins: "Animal source foods" sits on the left axis and was
         # clipped at the default margin.
@@ -355,10 +370,13 @@ def hei_component_bar(component_scores: dict[str, float], bounds: dict[str, dict
              "Whole Grains", "Dairy", "Total Protein", "Seafood & Plant Protein",
              "Fatty Acids", "Refined Grains", "Sodium", "Added Sugars", "Sat Fat"]
     labels, scores, maxes, fills, fracs = [], [], [], [], []
+    on_target = []
     for name in order:
         max_sc = bounds[name]["max_score"]
         sc = float(component_scores.get(name, 0.0))
         labels.append(f"{name} ({int(max_sc)} pt)")
+        if max_sc and sc >= max_sc - 1e-9:
+            on_target.append(labels[-1])
         scores.append(sc)
         maxes.append(max_sc)
         fracs.append(sc / max_sc if max_sc else 0)
@@ -397,6 +415,7 @@ def hei_component_bar(component_scores: dict[str, float], bounds: dict[str, dict
                    font=dict(size=14)),
         xaxis=dict(title="Score", range=[0, 12], gridcolor="rgba(0,0,0,0.08)"),
         yaxis=dict(automargin=True),
+        meta=dict(ontarget=on_target),
         height=440,
         margin=dict(l=20, r=80, t=60, b=50),
         plot_bgcolor="white",

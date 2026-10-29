@@ -20,6 +20,7 @@ Three Streamlit mechanisms have no equivalent in the browser and are rebuilt her
 from __future__ import annotations
 
 import html as _html
+import json
 import re
 import textwrap
 
@@ -188,7 +189,12 @@ def fig_html(fig) -> ui.HTML:
     height = fig.layout.height or 420
     inner = fig.to_html(full_html=False, include_plotlyjs=False,
                         default_height=f"{height}px", config=CHART_CONFIG)
-    return ui.HTML(f'<div class="chart-wrap">{inner}</div>')
+    # The names of the elements already on target, for CHART_FIT_JS to highlight.
+    # Plotly has no per-tick label style, so the page draws the highlight itself.
+    meta = fig.layout.meta
+    labels = list(meta.get("ontarget") or []) if isinstance(meta, dict) else []
+    attr = (f' data-ontarget="{_html.escape(json.dumps(labels))}"') if labels else ""
+    return ui.HTML(f'<div class="chart-wrap"{attr}>{inner}</div>')
 
 
 def table_html(rows, sizer_rows=None) -> ui.HTML:
@@ -246,6 +252,12 @@ def dot_legend(items) -> ui.HTML:
              f'-webkit-text-stroke:0.6px rgba(0,0,0,0.55);">&#9679;</span> {_html.escape(t)}'
              for c, t in items]
     return ui.HTML('<div class="dot-legend">' + "; ".join(parts) + "</div>")
+
+
+def ontarget_note() -> ui.HTML:
+    """Explains the light-green highlight drawn behind on-target chart labels."""
+    return ui.HTML('<div class="dot-legend">Element names highlighted like '
+                   '<span class="hl-sample">this</span> are already on target.</div>')
 
 
 def metric(label: str, value: str, delta: str = "") -> ui.Tag:
@@ -309,7 +321,7 @@ VIEWPORT_JS = """
 # scrollbar. This re-fits every chart to its box after the layout settles, and
 # again whenever that box changes size (window resized, sidebar opened or
 # closed, an expander opened).
-CHART_FIT_JS = """
+CHART_FIT_JS = r"""
 (function () {
   var timer = null;
   function fitAll() {            // debounced: a collapsing sidebar animates,
@@ -324,6 +336,59 @@ CHART_FIT_JS = """
       setTimeout(doFit, ms);
     });
   }
+  // Plotly styles every tick label of an axis the same way, so an individual
+  // label cannot be given its own colour through the figure. The page draws the
+  // highlight instead: a rounded rectangle behind the label's own glyphs, in the
+  // tick's coordinate system, so it follows the label wherever Plotly puts it.
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  var ON_TARGET_FILL = '__ON_TARGET_FILL__';
+  function squash(s) { return String(s).replace(/\s+/g, ''); }
+  function highlight(wrap) {
+    var raw = wrap.getAttribute('data-ontarget');
+    if (!raw) return;
+    var names;
+    try { names = JSON.parse(raw); } catch (e) { return; }
+    var wanted = {};
+    (names || []).forEach(function (n) { wanted[squash(n)] = true; });
+    // Angular labels on the round charts, category labels on the bar charts.
+    var labels = wrap.querySelectorAll(
+      '.angular-axis text, .yaxislayer-above text, .xaxislayer-above text');
+    Array.prototype.forEach.call(labels, function (t) {
+      var tick = t.parentNode;
+      if (!tick) return;
+      var mark = tick.querySelector('rect.on-target-mark');
+      // A wrapped label is several tspans; textContent joins them with no space,
+      // which is why both sides are compared with the whitespace taken out.
+      if (!wanted[squash(t.textContent)]) {
+        // Plotly reuses tick elements, so a label that is no longer on target
+        // can arrive wearing the previous one's highlight.
+        if (mark) tick.removeChild(mark);
+        return;
+      }
+      var box;
+      try { box = t.getBBox(); } catch (e) { return; }
+      if (!box || !box.width) return;
+      if (!mark) {
+        mark = document.createElementNS(SVGNS, 'rect');
+        mark.setAttribute('class', 'on-target-mark');
+        mark.setAttribute('rx', 3);
+        mark.setAttribute('fill', ON_TARGET_FILL);
+        mark.setAttribute('pointer-events', 'none');   // never swallow a hover
+        tick.insertBefore(mark, t);                    // behind the text, not over it
+      }
+      // getBBox is in the text's OWN coordinates, and Plotly puts the placement
+      // transform on the <text> element rather than on the tick group. Without
+      // copying it the highlight lands at the group's origin, not on the label.
+      var tf = t.getAttribute('transform');
+      if (tf) { mark.setAttribute('transform', tf); }
+      else { mark.removeAttribute('transform'); }
+      mark.setAttribute('x', box.x - 3);
+      mark.setAttribute('y', box.y - 1);
+      mark.setAttribute('width', box.width + 6);
+      mark.setAttribute('height', box.height + 2);
+    });
+  }
+
   function doFit() {
     if (!window.Plotly) return;
     var wraps = document.querySelectorAll('.chart-wrap');
@@ -339,6 +404,8 @@ CHART_FIT_JS = """
       // can only ever be exactly as wide as the box it sits in.
       try { Plotly.relayout(d, {width: target}); } catch (e) { }
     });
+    var marked = document.querySelectorAll('.chart-wrap[data-ontarget]');
+    Array.prototype.forEach.call(marked, highlight);
   }
   var ro = window.ResizeObserver ? new ResizeObserver(fitAll) : null;
   function scan() {
@@ -363,8 +430,13 @@ CHART_FIT_JS = """
   document.addEventListener('transitionend', fitAll, true);
   window.addEventListener('load', scan);
   window.addEventListener('resize', fitAll);
+  // Last resort. A ResizeObserver only delivers while the page is rendering, so
+  // a tab that was resized while in the background can come back with a chart
+  // still at its old width. doFit costs a handful of property reads when
+  // everything already fits, so checking occasionally is cheaper than the bug.
+  setInterval(doFit, 2000);
 })();
-"""
+""".replace("__ON_TARGET_FILL__", viz.ON_TARGET_FILL)
 
 CSS = """
 /* Black body text everywhere, matching the Streamlit theme's textColor. */
@@ -377,6 +449,8 @@ body, .bslib-page-sidebar { color: #000000; }
 h1.app-title { font-size: 2.1rem; font-weight: 700; margin: 0 0 0.6rem 0; }
 .section-title { font-size: 1.5rem; font-weight: 600; margin: 0.2rem 0 0.6rem 0; }
 .dot-legend { color: #000000; margin-bottom: 0.3rem; }
+/* The swatch in that legend line, matching viz.ON_TARGET_FILL. */
+.hl-sample { background: __ON_TARGET_FILL__; border-radius: 3px; padding: 0 4px; }
 
 /* Headline indicators: large, plain, no box (the app un-boxed these). */
 .metric { padding: 0.2rem 0; }
@@ -427,7 +501,7 @@ body { overflow-x: hidden; }
   .metric-value { font-size: 1.9rem; }
   .cmp-head { min-height: 0; margin-top: 0.6rem; }
 }
-"""
+""".replace("__ON_TARGET_FILL__", viz.ON_TARGET_FILL)
 
 
 # ---------------------------------------------------------------------- UI ----
@@ -838,6 +912,7 @@ def server(input, output, session):
                 ))
             out += [ui.HTML('<hr class="rule">'),
                     section_title("Comparison across Criteria"),
+                    ontarget_note(),
                     ui.layout_columns(*cols, col_widths=[4, 4, 4])]
 
         if show["chk_cal"]:
@@ -861,6 +936,7 @@ def server(input, output, session):
                 section_title("Healthy Eating Index Components"),
                 dot_legend([(viz.OK_COLOR, "Green dot: full score"),
                             (viz.EXCESSIVE_COLOR, "Red dot: 0 points")]),
+                ontarget_note(),
                 fig_html(black_text(round_fig(
                     viz.hei_anti_spider(hei_comps, HEI_BOUNDS), phone))),
                 expander("HEI components in table view, based on HEI-2020",
@@ -885,6 +961,7 @@ def server(input, output, session):
                 dot_legend([(viz.OK_COLOR, "Green dot: adequate"),
                             (viz.DEFICIENT_COLOR, "Blue dot: deficient"),
                             (viz.EXCESSIVE_COLOR, "Red dot: excessive")]),
+                ontarget_note(),
                 fig_html(black_text(round_fig(
                     with_title(viz.nutrient_anti_spider(dri_rows), dri_score_text), phone))),
                 expander("DRI components in table view, based on the 2011 version",
@@ -923,6 +1000,7 @@ def server(input, output, session):
                     (viz.OK_COLOR, "Green dot: at or above the calorie target of this food group"),
                     (viz.EXCESSIVE_COLOR, "Red dot: no calorie intake from this food group"),
                 ]),
+                ontarget_note(),
                 fig_html(black_text(round_fig(viz.hdb_bullseye(hdb), phone))),
             ]
 
