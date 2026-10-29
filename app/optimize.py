@@ -101,11 +101,53 @@ ADEQUACY_KEYS_FOR_NAME = {
 DISPLAY_TRIM_G = 0.02
 
 # Smallest amount the optimizer gives a food it counts toward HDB diversity.
-# The rule itself has NO minimum (any chosen food counts; see
-# data.HDB_MIN_ITEM_GRAMS = 0), but the MILP needs a positive floor to mean
-# "chosen" — at 0 it could count a food while giving it 0 g. 1 g is the smallest
-# amount that still appears as a food in the cart, which rounds to whole grams.
-OPT_SELECTED_MIN_G = 1.0
+# Must match data.HDB_MIN_ITEM_GRAMS, or the optimizer and the scorer disagree
+# about whether a group's diversity is met.
+OPT_SELECTED_MIN_G = float(data.HDB_MIN_ITEM_GRAMS)
+
+# Smallest amount of ANY food the optimizer may put in a diet. A food is either
+# left out or given at least this much, never a token 1-2 g that no one would
+# eat. Implemented with one binary per food (see _append_min_serving), so every
+# solve becomes a MILP. Set to 0.0 to switch the rule off.
+MIN_SERVING_G = 5.0
+
+
+def _append_min_serving(*, c, A_ub, b_ub, A_eq, lb, ub, integrality, n,
+                        min_g: float, big_m):
+    """Add one binary y_i per food forcing x_i into {0} union [min_g, M_i].
+
+        x_i - M_i * y_i <= 0      not selected  -> exactly 0 g
+       -x_i + min_g * y_i <= 0    selected      -> at least min_g
+
+    M_i is the most of food i the energy equality can admit on its own
+    (100 * calorie_target / energy_i), so the binaries impose no restriction
+    beyond the minimum-serving rule itself. A food already locked to 0 g keeps
+    its binary at 0 and contributes no rows.
+    """
+    n_now = len(c)
+    width = n_now + n
+
+    def pad(M):
+        if M.shape[0] == 0:
+            return np.zeros((0, width))
+        return np.hstack([M, np.zeros((M.shape[0], n))])
+
+    A_ub, A_eq = pad(A_ub), pad(A_eq)
+    rows, rb = [], []
+    for i in range(n):
+        if ub[i] <= 0:          # forbidden food: nothing to decide
+            continue
+        r = np.zeros(width); r[i] = 1.0;  r[n_now + i] = -float(big_m[i])
+        rows.append(r); rb.append(0.0)
+        r = np.zeros(width); r[i] = -1.0; r[n_now + i] = min_g
+        rows.append(r); rb.append(0.0)
+    if rows:
+        A_ub = np.vstack([A_ub] + rows)
+        b_ub = np.concatenate([b_ub, np.array(rb)])
+    y_ub = np.array([1.0 if ub[i] > 0 else 0.0 for i in range(n)])
+    return (np.concatenate([c, np.zeros(n)]), A_ub, b_ub, A_eq,
+            np.concatenate([lb, np.zeros(n)]), np.concatenate([ub, y_ub]),
+            np.concatenate([integrality, np.ones(n, dtype=int)]))
 
 
 def _build_density_coefficients(catalog, calorie_target: float):
@@ -146,7 +188,8 @@ def _solve_lp_for_alpha(target_hei: float, alpha_fa: float, *,
                          enforce_hdb: bool = False,
                          enforce_hdb_diversity: bool = False,
                          hdb_equal_types: bool = False,
-                         integer_grams: bool = False):
+                         integer_grams: bool = False,
+                         min_serving_g: float = 0.0):
     """Solve the LP/MILP with FA score forced to alpha_fa. Return (z, cost) or (None, inf).
 
     If `hdb_equal_types` is True (requires `enforce_hdb_diversity`), every food
@@ -210,10 +253,13 @@ def _solve_lp_for_alpha(target_hei: float, alpha_fa: float, *,
     c[:n] = price_p100 / 100.0
 
     # ---- bounds ----
-    # Each food's weight is a free continuous variable from 0 g up to +∞ (no
-    # artificial per-food ceiling). The problem stays bounded because total
-    # energy is pinned to calorie_target and costs are non-negative, so the
-    # cheapest feasible diet is always finite.
+    # A food's ceiling is the most of it the energy equality can admit on its
+    # own, 100 * calorie_target / energy_i. That is implied by the equality
+    # rather than imposed on top of it, so stating it explicitly rules nothing
+    # out — and it gives the minimum-serving binaries a finite, tight big-M.
+    big_m = np.where(energy_p100 > 0,
+                     100.0 * calorie_target / np.where(energy_p100 > 0, energy_p100, 1.0),
+                     0.0)
     excluded = set(EXCLUDED_FOODS)
     bounds = []
     for i in range(n):
@@ -221,7 +267,7 @@ def _solve_lp_for_alpha(target_hei: float, alpha_fa: float, *,
         if nm_i in excluded or (enforce_hdb and group_of[i] is None):
             bounds.append((0.0, 0.0))   # food forbidden / unclassified for HDB
         else:
-            bounds.append((0.0, np.inf))
+            bounds.append((0.0, float(big_m[i])))
     for nm in SCORE_NAMES:
         bounds.append((0.0, hei_bounds[nm]["max_score"]))
 
@@ -335,34 +381,45 @@ def _solve_lp_for_alpha(target_hei: float, alpha_fa: float, *,
             c=c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds,
             n=n, n_vars=n_vars, group_of=group_of, type_of=type_of,
             hdb_equal_types=hdb_equal_types, energy_p100=energy_p100,
-            group_kcal=group_kcal)
+            group_kcal=group_kcal, min_serving_g=min_serving_g, big_m=big_m)
 
-    if integer_grams:
-        # MILP path: gram variables integer, score variables continuous.
-        # Energy is relaxed to a small UPPER window so integer combinations
-        # can hit at least 2330 kcal without overshooting.
+    if integer_grams or min_serving_g > 0:
+        # MILP path. Integer grams make every gram variable integer; the
+        # minimum-serving rule adds one binary per food. Either way the energy
+        # equality is relaxed to a small UPPER window ONLY for integer grams,
+        # which cannot usually hit a real-valued kcal target exactly.
         integrality = np.zeros(n_vars, dtype=int)
-        integrality[:n] = 1
+        if integer_grams:
+            integrality[:n] = 1
         lb_arr = np.array([b[0] for b in bounds])
         ub_arr = np.array([b[1] for b in bounds])
-        bounds_obj = Bounds(lb=lb_arr, ub=ub_arr)
-        constraints = [LinearConstraint(
-            A_eq, lb=calorie_target, ub=calorie_target + ENERGY_INT_SLACK_KCAL,
-        )]
-        if A_ub.shape[0] > 0:
-            constraints.append(LinearConstraint(A_ub, ub=b_ub))
+        c_m, A_ub_m, b_ub_m, A_eq_m = c, A_ub, b_ub, A_eq
+        if min_serving_g > 0:
+            (c_m, A_ub_m, b_ub_m, A_eq_m, lb_arr, ub_arr,
+             integrality) = _append_min_serving(
+                c=c_m, A_ub=A_ub_m, b_ub=b_ub_m, A_eq=A_eq_m,
+                lb=lb_arr, ub=ub_arr, integrality=integrality, n=n,
+                min_g=min_serving_g, big_m=big_m)
+        eq_hi = (calorie_target + ENERGY_INT_SLACK_KCAL if integer_grams
+                 else b_eq)
+        eq_lo = calorie_target if integer_grams else b_eq
+        constraints = [LinearConstraint(A_eq_m, lb=eq_lo, ub=eq_hi)]
+        if A_ub_m.shape[0] > 0:
+            constraints.append(LinearConstraint(A_ub_m, ub=b_ub_m))
         res = milp(
-            c=c,
+            c=c_m,
             constraints=constraints,
             integrality=integrality,
-            bounds=bounds_obj,
+            bounds=Bounds(lb=lb_arr, ub=ub_arr),
             options={"presolve": True, "time_limit": 30.0},
         )
-        if res.x is None:
+        # Accept only a proven optimum: a time-limited best-so-far depends on
+        # timing, so the same request could return different diets.
+        if not res.success or res.x is None:
             return None, float("inf")
-        return res.x, float(res.fun)
+        return res.x[:n_vars], float(res.fun)
 
-    # Continuous LP path (legacy / verification)
+    # Continuous LP path (no integer rule in force)
     res = linprog(
         c=c,
         A_ub=A_ub, b_ub=b_ub,
@@ -380,7 +437,8 @@ def _solve_lp_for_alpha(target_hei: float, alpha_fa: float, *,
 
 def _solve_with_hdb_diversity(*, c, A_ub, b_ub, A_eq, b_eq, bounds, n, n_vars,
                                group_of, type_of, hdb_equal_types=False,
-                               energy_p100=None, group_kcal=None):
+                               energy_p100=None, group_kcal=None,
+                               min_serving_g=0.0, big_m=None):
     """Augment the base LP with binary food-TYPE selection variables and solve as
     a MILP that enforces the HDB minimum distinct-types-per-group rule.
 
@@ -462,17 +520,19 @@ def _solve_with_hdb_diversity(*, c, A_ub, b_ub, A_eq, b_eq, bounds, n, n_vars,
     if hdb_equal_types:
         for k, key in enumerate(types):
             grp = key[0]
-            big_m = float(group_kcal[grp])
+            # Named apart from the per-food `big_m` parameter, which this loop
+            # would otherwise shadow.
+            m_grp = float(group_kcal[grp])
             kcal = np.zeros(n_total)
             for i in members[key]:
                 kcal[i] = energy_p100[i] / 100.0
             w, sg = base + k, share_col[grp]
-            r = kcal.copy(); r[w] = -big_m        # c_t - M*w_t <= 0
+            r = kcal.copy(); r[w] = -m_grp        # c_t - M*w_t <= 0
             rows.append(r); rb.append(0.0)
             r = kcal.copy(); r[sg] = -1.0         # c_t - s_g <= 0
             rows.append(r); rb.append(0.0)
-            r = -kcal; r[sg] = 1.0; r[w] = big_m  # -c_t + s_g + M*w_t <= M
-            rows.append(r); rb.append(big_m)
+            r = -kcal; r[sg] = 1.0; r[w] = m_grp  # -c_t + s_g + M*w_t <= M
+            rows.append(r); rb.append(m_grp)
 
     A_ub_all = np.vstack([A_ub_p] + rows) if rows else A_ub_p
     b_ub_all = np.concatenate([b_ub, np.array(rb)]) if rb else b_ub
@@ -482,6 +542,15 @@ def _solve_with_hdb_diversity(*, c, A_ub, b_ub, A_eq, b_eq, bounds, n, n_vars,
                   + [float(group_kcal[g]) for g in share_groups])
     integrality = np.zeros(n_total, dtype=int)
     integrality[base:base + n_bin] = 1  # only the selection indicators are integer
+
+    # Minimum serving size: one more binary per food, appended after the type
+    # indicators and the group shares.
+    if min_serving_g > 0:
+        (c_p, A_ub_all, b_ub_all, A_eq_p, lb, ub,
+         integrality) = _append_min_serving(
+            c=c_p, A_ub=A_ub_all, b_ub=b_ub_all, A_eq=A_eq_p,
+            lb=lb, ub=ub, integrality=integrality, n=n,
+            min_g=min_serving_g, big_m=big_m)
 
     constraints = [LinearConstraint(A_eq_p, lb=b_eq, ub=b_eq)]
     if A_ub_all.shape[0] > 0:
@@ -507,6 +576,7 @@ def optimize_diet_lp(target_hei: float, *, catalog, prices_df, hei_bounds,
                      enforce_hdb_diversity: bool = False,
                      hdb_equal_types: bool = False,
                      integer_grams: bool = True,
+                     min_serving_g: float | None = None,
                      ) -> tuple[dict[str, float], float, float] | None:
     """Solve at every alpha_FA in fa_grid; return cheapest feasible integer-gram diet.
 
@@ -517,6 +587,10 @@ def optimize_diet_lp(target_hei: float, *, catalog, prices_df, hei_bounds,
     Returns (diet_dict, cost, achieved_hei) or None if every alpha is infeasible.
     """
     n = len(catalog)
+    # Read MIN_SERVING_G at call time: a default argument would freeze its value
+    # when this module is imported, so changing the constant would do nothing.
+    if min_serving_g is None:
+        min_serving_g = MIN_SERVING_G
 
     # If HEI is not enforced, the alpha grid is irrelevant — single solve.
     alpha_iter = list(fa_grid) if enforce_hei_floor else [0.0]
@@ -531,6 +605,7 @@ def optimize_diet_lp(target_hei: float, *, catalog, prices_df, hei_bounds,
             enforce_hdb_diversity=enforce_hdb_diversity,
             hdb_equal_types=hdb_equal_types,
             integer_grams=integer_grams,
+            min_serving_g=min_serving_g,
         )
         if z is not None and cost < best_cost:
             best_cost = cost
@@ -636,10 +711,14 @@ def _solve_guideline_set(active, *, catalog, prices_df, hei_bounds, dri,
     hdb_with = HDB_WITH_DIVERSITY in names
     hdb_without = HDB_WITHOUT_DIVERSITY in names
     enforce_hdb = hdb_with or hdb_without
-    # Food-type diversity (and the equal-calorie rule) apply ONLY when HDB is the
-    # single criterion the user chose. Combined with DRI and/or HEI, HDB means the
-    # six group-energy shares only. Excluded foods are never used when HDB is on.
-    enforce_div = hdb_with and hdb_only
+    # Food-type diversity applies whenever the user picks the "with diversity"
+    # variant, on its own or alongside DRI and/or HEI.
+    enforce_div = hdb_with
+    # The equal-calorie rule (every used type in a group supplies the same
+    # calories) is relaxed when HDB is combined with another criterion: stacked on
+    # DRI bounds and an HEI floor it is usually infeasible, and it is the one HDB
+    # rule that is a modelling choice rather than part of the guideline.
+    enforce_equal = hdb_with and hdb_only
     hei_target = next((t for (nm, t) in active if nm == "HEI 2020"), 0.0)
     # "Thrifty Food Plan" adds nothing (undefined) — silently contributes no rules.
 
@@ -649,7 +728,7 @@ def _solve_guideline_set(active, *, catalog, prices_df, hei_bounds, dri,
         dri=(dri if enforce_dri else None),
         enforce_hei_floor=enforce_hei, enforce_hdb=enforce_hdb,
         enforce_hdb_diversity=enforce_div,  # only the "with diversity" variant
-        hdb_equal_types=enforce_div,
+        hdb_equal_types=enforce_equal,
         integer_grams=False,
     )
     if out is None:
@@ -712,9 +791,10 @@ def optimize_criteria(criteria, *, catalog, prices_df, hei_bounds, dri,
                      "distinct-items-per-group rule is NOT applied — expect groups to "
                      "collapse onto the cheapest single food.")
 
-    # HDB-only rules (food-type diversity + equal calories per type) switch on only
-    # when HDB is the single criterion the user chose. Decided from the user's
-    # selection, so a fallback subset of a larger selection never turns them on.
+    # The equal-calorie-per-type rule switches on only when HDB is the single
+    # criterion the user chose (food-type diversity now applies in every case).
+    # Decided from the user's selection, so a fallback subset of a larger
+    # selection never turns it on.
     hdb_only = names == [HDB_WITH_DIVERSITY]
 
     for size in range(len(crit), 0, -1):

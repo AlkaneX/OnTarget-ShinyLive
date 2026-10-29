@@ -2,7 +2,7 @@
 
 **Nutritional Quality and Cost Calculator for Hypothetical Diets in Boston**
 
-Open the calculator: **https://alkanex.github.io/OnTarget-ShinyLive/**
+Open the calculator: **https://wanqingxu-nutrition.github.io/OnTarget-ShinyLive/**
 
 Build a daily diet from 93 foods sold at Stop & Shop in Boston, or let the
 calculator find the lowest-cost diet that meets the health criteria you choose.
@@ -73,7 +73,7 @@ registers a service worker.
 ## Embedding it in a web page
 
 ```html
-<iframe src="https://alkanex.github.io/OnTarget-ShinyLive/"
+<iframe src="https://wanqingxu-nutrition.github.io/OnTarget-ShinyLive/"
         title="OnTarget — Diet Optimizer"
         style="width:100%;height:1100px;border:1px solid #ddd;border-radius:6px;"
         loading="lazy"></iframe>

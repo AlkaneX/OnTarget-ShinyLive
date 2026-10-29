@@ -2,9 +2,9 @@
 #
 #  • Always: packages the offline Windows bundle and attaches it to the run as a
 #    downloadable artifact.
-#  • Pages deploy: runs only in the public repository (AlkaneX/OnTarget-ShinyLive).
-#    In the private development repo the build runs as a check and the deploy
-#    job is skipped.
+#  • Pages deploy: runs in either public repository, so the same file serves
+#    both. In the private development repo the build runs as a check and the
+#    deploy job is skipped.
 name: Build ShinyLive site
 
 on:
@@ -61,9 +61,11 @@ jobs:
 
   deploy:
     needs: build
-    # Only the public repository publishes. The private development repo runs
-    # the build as a check and stops there.
-    if: github.repository == 'AlkaneX/OnTarget-ShinyLive'
+    # Either public repository publishes its own copy. The private development
+    # repo runs the build as a check and stops there.
+    if: >-
+      github.repository == 'wanqingxu-nutrition/OnTarget-ShinyLive' ||
+      github.repository == 'AlkaneX/OnTarget-ShinyLive'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

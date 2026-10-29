@@ -497,11 +497,12 @@ HDB_TARGET_KCAL = {
 }
 HDB_KCAL_TOTAL = sum(HDB_TARGET_KCAL.values())  # 2330 = 1160+110+160+300+300+300
 
-# Diversity rule: ANY chosen food (any amount above 0 g) counts as one of its
-# group's distinct items — there is no minimum weight. (This was 5 g before.)
-# Scoring counts every food with grams > 0; the optimizer, which cannot express
-# "strictly above 0", uses optimize.OPT_SELECTED_MIN_G instead.
-HDB_MIN_ITEM_GRAMS = 0.0
+# Diversity rule: a food counts as one of its group's distinct items only if it
+# supplies at least this many grams. Without a floor the optimizer satisfies a
+# group's item count with token amounts — 1 g of banana — which is not a food
+# anyone eats. Scoring and the optimizer must agree on this number, so
+# optimize.OPT_SELECTED_MIN_G is kept equal to it.
+HDB_MIN_ITEM_GRAMS = 5.0
 
 # Minimum number of distinct food items required per group (diet diversity).
 HDB_MIN_ITEMS = {
